@@ -91,20 +91,31 @@ async def iranpaper_login(page: Page):
 
     print("[+] Logging into IranPaper...")
 
+    async def _wait_challenge(p: Page, total_ms=20000):
+        # انتظار فعال برای چک مرورگر/turnstile
+        t0 = time.time()
+        while (time.time() - t0) * 1000 < total_ms:
+            html = (await p.content()).lower()
+            if any(s in html for s in ["checking your browser", "turnstile", "cf-chl", "cloudflare"]):
+                await asyncio.sleep(1.0)
+                continue
+            # اگر فرم را دیدیم، خارج شو
+            if await p.locator('input[type="email"], input[name="email"], input[placeholder*="ایمیل"]').count() > 0 \
+               or await p.locator('input[type="password"], input[name="password"]').count() > 0:
+                return
+            await asyncio.sleep(0.5)
+
     try:
-        # همیشه اول صفحهٔ اصلی
-        await page.goto("https://iranpaper.ir/", timeout=60000, wait_until="domcontentloaded")
+        # مستقیم به صفحهٔ لاگین برو
+        await page.goto("https://iranpaper.ir/login", timeout=60000, wait_until="domcontentloaded")
+        await _wait_challenge(page, total_ms=25000)
 
-        # اگر همین حالا لاگینیم، تمام
-        if await _iranpaper_is_logged_in(page):
-            print("[+] IranPaper already logged in; skipping login form.")
-            try:
-                await page.context.storage_state(path="session_iranpaper.json")
-            except Exception:
-                pass
-            return
+        # اگر هنوز فرم بیرون نیامد، یک بار رفرش
+        if await page.locator('input[name="email"], input[type="email"]').count() == 0:
+            await page.reload(wait_until="domcontentloaded")
+            await _wait_challenge(page, total_ms=15000)
 
-        # هر بنر/کوکی مزاحم را ببند
+        # بستن بنرهای کوکی/مودال
         for sel in [
             'button:has-text("قبول")',
             'button:has-text("باشه")',
@@ -118,48 +129,34 @@ async def iranpaper_login(page: Page):
             except Exception:
                 pass
 
-        # دکمهٔ «ورود» را پیدا و کلیک کن
-        for sel in [
-            'a:has-text("ورود")',
-            'button:has-text("ورود")',
-            'a[href*="login"]',
-            'a[href*="signin"]',
-        ]:
-            try:
-                loc = page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    await loc.click(timeout=3000)
-                    await asyncio.sleep(0.5)
-                    break
-            except Exception:
-                pass
-
-        # فرم را (در بدنه یا فریم) پر کن
+        # تلاش برای پر کردن فرم در صفحهٔ اصلی
         async def fill_form(root):
             email = root.locator(
-                'input[name="email"], input[type="email"], input[placeholder*="ایمیل"], input[placeholder*="نام\u200cکاربری"]'
+                'input[name="email"], input[type="email"], input[placeholder*="ایمیل"], input[placeholder*="نام\u200cکاربری"], input[placeholder*="کاربری"]'
             ).first
-            await email.wait_for(state="visible", timeout=10000)
+            await email.wait_for(state="visible", timeout=15000)
             await email.click()
             await email.fill(user)
 
             pwd = root.locator(
-                'input[name="password"], input[type="password"], input[placeholder*="رمز"]'
+                'input[name="password"], input[type="password"], input[placeholder*="رمز"], input[placeholder*="گذرواژه"]'
             ).first
-            await pwd.wait_for(state="visible", timeout=10000)
+            await pwd.wait_for(state="visible", timeout=15000)
             await pwd.click()
             await pwd.fill(password)
 
             # ارسال
             try:
-                btn = root.get_by_role("button", name=re.compile(r"(ورود|login|sign ?in)", re.I))
+                btn = root.get_by_role("button", name=re.compile(r"(ورود|login|sign ?in|ورود به حساب)", re.I))
                 await btn.click(timeout=4000)
             except Exception:
                 await root.locator('button[type="submit"], input[type="submit"]').first.click(timeout=4000)
 
+        # 1) سعی مستقیم
         try:
             await fill_form(page)
         except Exception:
+            # 2) اگر داخل iframe باشد
             filled = False
             for f in page.frames:
                 try:
@@ -167,19 +164,24 @@ async def iranpaper_login(page: Page):
                 except Exception:
                     continue
             if not filled:
-                raise
+                await page.screenshot(path="login_error.png", full_page=True)
+                raise RuntimeError("Login form not found (after challenge).")
 
-        # منتظر پایدار شدن و تأیید لاگین
+        # منتظر لاگین و نشانه‌های آن
         try:
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:
             pass
 
+        # تأیید لاگین: وجود لینک خروج یا منوی کاربر
         if not await _iranpaper_is_logged_in(page):
             await page.screenshot(path="login_error.png", full_page=True)
             raise RuntimeError("Login not confirmed (no logout/user markers).")
 
-        await page.context.storage_state(path="session_iranpaper.json")
+        try:
+            await page.context.storage_state(path="session_iranpaper.json")
+        except Exception:
+            pass
         print("[+] Logged into IranPaper successfully!")
 
     except Exception as e:
@@ -428,3 +430,4 @@ async def iranpaper_download(page: Page, doi: str, download_dir: str = str(DOWNL
     # 6-d) آخرین تلاش: کمی صبر و اگر باز هم نشد، اسکرین‌شات برای دیباگ
     await popup.screenshot(path=f"iranpaper_viewer_error_{doi.replace('/', '_')}.png", full_page=True)
     raise RuntimeError("Could not obtain PDF from viewer or context download.")
+
