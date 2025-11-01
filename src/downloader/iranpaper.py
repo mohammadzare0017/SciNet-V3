@@ -40,7 +40,7 @@ class IranPaperClient:
     
     async def periodic_relogin(self, page: Page, notify: Optional[NotifyFn] = None):
         while True:
-            wait_time = random.randint(4 * 3600, 6 * 3600)  # بین ۴ تا ۶ ساعت
+            wait_time = random.randint(4 * 3600, 6 * 3600)
             logger.info(f"🕒 ورود مجدد بعد از {wait_time // 3600} ساعت.")
             await asyncio.sleep(wait_time)
 
@@ -50,14 +50,13 @@ class IranPaperClient:
                 await asyncio.sleep(3)
 
                 await page.goto("https://iranpaper.ir/login", timeout=30000)
-                await page.fill('input[name="email"]', os.getenv("IRANPAPER_USER"))
-                await page.fill('input[name="password"]', os.getenv("IRANPAPER_PASS"))
+                await page.fill('input[name="email"]', self.username)   # ← اینجا
+                await page.fill('input[name="password"]', self.password) # ← و اینجا
                 await page.click('button[type="submit"]')
                 await page.wait_for_load_state("networkidle")
 
                 logger.info("✅ ورود مجدد به IranPaper با موفقیت انجام شد.")
 
-                # اگر کالبک نوتیفایر داده شده، خبر بده
                 if notify is not None:
                     await notify(
                         doi="N/A",
@@ -68,6 +67,7 @@ class IranPaperClient:
                     )
             except Exception as e:
                 logger.error(f"❌ خطا در ورود مجدد به IranPaper: {e}", exc_info=True)
+
 
 async def _iranpaper_is_logged_in(page: Page) -> bool:
     """
@@ -435,5 +435,4 @@ async def iranpaper_download(page: Page, doi: str, download_dir: str = str(DOWNL
     # 6-d) آخرین تلاش: کمی صبر و اگر باز هم نشد، اسکرین‌شات برای دیباگ
     await popup.screenshot(path=f"iranpaper_viewer_error_{doi.replace('/', '_')}.png", full_page=True)
     raise RuntimeError("Could not obtain PDF from viewer or context download.")
-
 
