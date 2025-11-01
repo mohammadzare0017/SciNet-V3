@@ -281,16 +281,24 @@ class SciNetClient:
         ctx = await self._browser.new_context(**ctx_kwargs)
 
         if DEBUG_MODE:
+            ctx.on("console", lambda m: logger.debug(" JS: %s", m.text))
+
             def _req_failed(r):
                 try:
-                    if r.method == "HEAD":  # نویز keepalive را نادیده بگیر
-                        return
+                    fr = r.failure or {}
+                    if isinstance(fr, dict):
+                        err = fr.get("errorText") or fr.get("error_text") or fr
+                    else:
+                        err = getattr(fr, "errorText", None) or getattr(fr, "error_text", None) or fr or "unknown"
+                    logger.debug(" FAIL %s %s | err=%s", r.method, r.url, err)
                 except Exception:
-                    pass
-                logger.debug(" FAIL %s %s", r.method, r.url)
+                    logger.debug(" FAIL %s %s", r.method, r.url)
 
-            ctx.on("console", lambda m: logger.debug(" JS: %s", m.text))
             ctx.on("requestfailed", _req_failed)
+
+
+       
+
 
         self.page = await ctx.new_page()
         self.page.on("crash", lambda *_: asyncio.create_task(self._recover("page crash")))
@@ -428,139 +436,101 @@ class SciNetClient:
     @dbg
     async def _enable_ultrafast_request_listener(self):
         """
-        شنود CDP برای پاسخ‌های شبکه و واکنش فوری به /request یا /requests
-        + شکار از URL/postData + WebSocket (سرعت حداکثری).
+        شنود CDP با هماهنگ‌سازی responseReceived + loadingFinished.
+        فقط روی /request و /requests کار می‌کند؛ هیچ regex عمومی روی HTML اجرا نمی‌شود.
         """
+        import asyncio, json, base64, time as _t
         p = self.page; assert p
         self._cdp = await p.context.new_cdp_session(p)
-        # بزرگ‌کردن بافرها (در برخی نسخه‌ها بی‌اثر است ولی ضرری ندارد)
-        try:
-            await self._cdp.send("Network.enable", {
-                "maxTotalBufferSize": 10 * 1024 * 1024,
-                "maxResourceBufferSize": 10 * 1024 * 1024
-            })
-        except Exception:
-            await self._cdp.send("Network.enable", {})
+        await self._cdp.send("Network.enable", {})
 
         dry = DRY_RUN
+        self._pending: dict[str, dict] = {}
 
-        # ➊ شکار «پیش از پاسخ» — سریع‌تر از responseReceived
-        async def on_request(params: dict):
+        async def _process_body(request_id: str, url: str, body_text: str):
             try:
-                req  = (params or {}).get("request", {}) or {}
-                url  = (req.get("url") or "")
-                if not url:
+                if "/request" not in url and "/requests" not in url:
                     return
-                lurl = url.lower()
-                interesting = any(k in lurl for k in ("/request", "/requests", "/api/", "/graphql"))
-                post = req.get("postData") or ""
-                blob = f"{url}\n{post}"
-                for m in self._doi_re.findall(blob):
-                    self._log_detect(src="cdp_req", url=url, doi=m, note=("interesting" if interesting else "from_post/url"))
-                    await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
+
+                if "/requests" in url:
+                    try:
+                        data = json.loads(body_text) or {}
+                        docs = data.get("docs") or []
+                        if isinstance(docs, list):
+                            for doc in docs:
+                                await self._handle_new_request_payload(doc, dry=dry, is_doc=True)
+                    except Exception:
+                        pass
+                    return
+
+                if "/request" in url:
+                    try:
+                        data = json.loads(body_text) or {}
+                        node = (data.get("success") or {}).get("data") or data.get("data")
+                        if isinstance(node, dict):
+                            await self._handle_new_request_payload(node, dry=dry, is_doc=False)
+                    except Exception:
+                        pass
             except Exception:
                 if DEBUG_MODE:
-                    logger.exception("ultrafast request listener failed")
+                    logger.exception("cdp _process_body failed")
 
-        # ➋ شکار «پس از پاسخ»
-        async def on_response(params: dict):
+        async def _stage_on_response(params: dict):
             try:
-                resp = params.get("response", {}) or {}
-                url  = (resp.get("url", "") or "")
-                if not url:
+                resp = params.get("response") or {}
+                url  = resp.get("url") or ""
+                rid  = params.get("requestId")
+                if not rid or ("/request" not in url and "/requests" not in url):
                     return
-                lurl = url.lower()
-                # فیلتر بازتر: /request, /requests, /api/*, /graphql
-                interesting = any(k in lurl for k in ("/request", "/requests", "/api/", "/graphql"))
+                self._pending[rid] = {"url": url, "ts": _t.time()}
+            except Exception:
+                if DEBUG_MODE:
+                    logger.exception("ultrafast listener on_response staging failed")
 
-                req_id = params.get("requestId")
-                if not req_id:
-                    return
-                body_res = await self._cdp.send("Network.getResponseBody", {"requestId": req_id})
-                body = body_res.get("body", "") or ""
+        async def _on_loading_finished(params: dict):
+            rid = params.get("requestId")
+            entry = self._pending.pop(rid, None)
+            if not entry:
+                return
+            url = entry["url"]
+            try:
+                body_res = await self._cdp.send("Network.getResponseBody", {"requestId": rid})
+                body = body_res.get("body") or ""
                 if body_res.get("base64Encoded"):
                     try:
                         body = base64.b64decode(body).decode("utf-8", "ignore")
                     except Exception:
-                        return
-
-                # 1) حالت لیست: /requests با docs
-                if "/requests" in lurl:
-                    try:
-                        data = json.loads(body)
-                        docs = (data or {}).get("docs") or []
-                        if isinstance(docs, list):
-                            for doc in docs:
-                                if isinstance(doc, dict) and "doi" in doc:
-                                    self._log_detect(src="cdp_resp_list", url=url, doi=str(doc.get("doi")), note="docs[]")
-                                await self._handle_new_request_payload(doc, dry=dry, is_doc=True)
-                    except Exception:
-                        matches = self._doi_re.findall(body)
-                        if matches:
-                            self._log_detect(src="cdp_resp_list", url=url, doi=",".join(matches),
-                                             note="regex_fallback", preview=body[:300])
-                        for m in matches:
-                            await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
+                        body = ""
+                if body:
+                    await _process_body(rid, url, body)
+            except Exception as e:
+                # خطاهای «resource not found / no data» رو ساکت رد کن
+                msg = str(e).lower()
+                if "no resource with given identifier" in msg or "no data found" in msg:
                     return
-
-                # 2) حالت تکی: /request با success.data
-                if "/request" in lurl:
-                    node = None
-                    try:
-                        data = json.loads(body)
-                        node = (data.get("success") or {}).get("data") or data.get("data")
-                    except Exception:
-                        matches = self._doi_re.findall(body)
-                        if matches:
-                            self._log_detect(src="cdp_resp_single", url=url, doi=",".join(matches),
-                                             note="regex_fallback", preview=body[:300])
-                        for m in matches:
-                            await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=False)
-                        return
-
-                    if not isinstance(node, dict):
-                        return
-
-                    if "doi" in node:
-                        self._log_detect(src="cdp_resp_single", url=url, doi=str(node.get("doi")), note="success.data")
-                    await self._handle_new_request_payload(node, dry=dry, is_doc=False)
-                    return
-
-                # 3) حالت عمومی‌تر (/api/* یا /graphql یا هر پاسخ دیگری) با Regex DOI
-                matches = self._doi_re.findall(body)
-                if matches:
-                    self._log_detect(src="cdp_resp_generic", url=url, doi=",".join(matches),
-                                     note="regex_generic", preview=body[:300])
-                for m in matches:
-                    await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
-
-            except Exception:
                 if DEBUG_MODE:
-                    logger.exception("ultrafast listener failed")
+                    logger.exception("ultrafast listener getResponseBody failed")
 
-        # رویدادهای CDP را ثبت کنیم
-        self._cdp.on("Network.requestWillBeSent",  lambda ev: asyncio.create_task(on_request(ev)))
-        self._cdp.on("Network.responseReceived",   lambda ev: asyncio.create_task(on_response(ev)))
+        # اتصال رویدادهای CDP
+        self._cdp.on("Network.responseReceived", lambda p: asyncio.create_task(_stage_on_response(p)))
+        self._cdp.on("Network.loadingFinished", lambda p: asyncio.create_task(_on_loading_finished(p)))
 
-        # ➌ شنود WebSocket برای payloadهایی که DOI درونشان است (push-based sites)
-        async def on_ws_frame(params: dict):
+        # فالو‌بک Playwright برای وقتی CDP چیزی نده
+        async def _pw_on_response(resp):
             try:
-                payload = ((params.get("response") or {}).get("payloadData")) or ""
-                if not payload:
+                url = resp.url or ""
+                if "/request" not in url and "/requests" not in url:
                     return
-                matches = self._doi_re.findall(payload)
-                if matches:
-                    self._log_detect(src="cdp_ws_rx", url="", doi=",".join(matches),
-                                     note="ws_frame", preview=payload[:300])
-                for m in matches:
-                    await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
+                ctype = (resp.headers or {}).get("content-type", "")
+                if "application/json" not in ctype.lower():
+                    return
+                txt = await resp.text()
+                await _process_body("pw", url, txt)
             except Exception:
                 if DEBUG_MODE:
-                    logger.exception("ws sniff failed")
-        try:
-            self._cdp.on("Network.webSocketFrameReceived", lambda ev: asyncio.create_task(on_ws_frame(ev)))
-        except Exception:
-            pass
+                    logger.exception("fallback page.on(response) failed")
+
+        p.on("response", lambda r: asyncio.create_task(_pw_on_response(r)))
 
     @dbg
     async def _inject_observer(self):
@@ -1069,11 +1039,16 @@ async def main():
     if not DRY_RUN:
         if "iranpaper" in sources:
             iran_page = await client.page.context.new_page()
-            
             print("[+] IranPaper tab opened successfully!")
-            await iranpaper_login(iran_page)
-            ipc = IranPaperClient(IRANPAPER_USER, IRANPAPER_PASS, download_dir=str(DOWNLOAD_DIR))
-            asyncio.create_task(ipc.periodic_relogin(iran_page, notify=send_telegram))
+            try:
+                await iranpaper_login(iran_page)
+                ipc = IranPaperClient(IRANPAPER_USER, IRANPAPER_PASS, download_dir=str(DOWNLOAD_DIR))
+                asyncio.create_task(ipc.periodic_relogin(iran_page, notify=send_telegram))
+            except Exception:
+                logger.exception("[IranPaper] login failed")
+                await iran_page.screenshot(path="iranpaper_login_error.png")
+                print("💥 IranPaper login failed; continuing without it.")
+
 
         if "gigalib" in sources:
             giga_page = await client.page.context.new_page()
@@ -1440,14 +1415,31 @@ async def cancel_scinet_request(page: Page, detail_url: str, doi: str) -> bool:
         ]
 
         clicked = False
+
         for sel in selectors:
+            loc = sel if hasattr(sel, "click") else page.locator(sel)
+            first = loc.first
             try:
-                loc = sel if hasattr(sel, "click") else page.locator(sel)
-                if await loc.first.count() > 0 and await loc.first.is_visible(timeout=800):
-                    await loc.first.click(timeout=2000)
-                    clicked = True
-                    break
-            except Exception:
+                # سریع ببین چیزی هست
+                if not await first.count():
+                    continue
+
+                # اول attach بعد visible (visible ممکنه تایم‌اوت بده، اشکال ندارد)
+                try:
+                    await first.wait_for(state="attached", timeout=500)
+                except Exception:
+                    pass
+
+                await first.wait_for(state="visible", timeout=1500)
+                await first.click(timeout=2000)
+                clicked = True
+                break
+
+            except Exception as e:
+                # اگر دوست داری فقط Timeout را بی‌صدا رد کنی:
+                # from playwright._impl._errors import TimeoutError
+                # if isinstance(e, TimeoutError): continue
+                logger.debug("click attempt failed for %s: %s", getattr(sel, "selector", sel), e)
                 continue
 
         if clicked:
