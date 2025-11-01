@@ -161,10 +161,12 @@ state = BotState.load()
 
 # ── متادیتا Crossref/OpenAlex ───────────────────────────────
 @dbg
-async def xref(sess:aiohttp.ClientSession, doi:str):
+async def xref(sess: aiohttp.ClientSession, doi: str):
     try:
         async with sess.get(f"https://api.crossref.org/works/{doi}", timeout=8) as r:
-            if not r.ok: return "", "", None, "", ""   # ← پنج مقدار
+            # روش A: فقط 2xx
+            if not (200 <= r.status < 300):
+                return "", "", None, "", ""
             m = (await r.json())["message"]
             return (
                 m.get("title", [""])[0],
@@ -174,13 +176,15 @@ async def xref(sess:aiohttp.ClientSession, doi:str):
                 m.get("type", "")
             )
     except Exception as e:
-        logger.debug("⚠️ Crossref error %s", e); return "", "", None, "", ""  # ← پنج مقدار
+        logger.debug("⚠️ Crossref error %s", e)
+        return "", "", None, "", ""
 
 @dbg
-async def oalex(sess:aiohttp.ClientSession, doi:str):
+async def oalex(sess: aiohttp.ClientSession, doi: str):
     try:
         async with sess.get(f"https://api.openalex.org/works/doi:{doi}", timeout=8) as r:
-            if not r.ok: return "", "", None, "", ""   # ← پنج مقدار
+            if not (200 <= r.status < 300):
+                return "", "", None, "", ""
             m = await r.json()
             return (
                 m.get("title", ""),
@@ -190,7 +194,9 @@ async def oalex(sess:aiohttp.ClientSession, doi:str):
                 m.get("type", "")
             )
     except Exception as e:
-        logger.debug("⚠️ OpenAlex error %s", e); return "", "", None, "", ""  # ← پنج مقدار
+        logger.debug("⚠️ OpenAlex error %s", e)
+        return "", "", None, "", ""
+
 def _openalex_abs_to_text(inv):
     """abstract_inverted_index را به متن خوانا تبدیل می‌کند."""
     if not isinstance(inv, dict):
