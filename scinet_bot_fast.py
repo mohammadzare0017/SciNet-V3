@@ -18,7 +18,7 @@ import base64, re
 
 from src.downloader.gigalib import gigalib_login, gigalib_download
 from src.utils.stealth import human_sleep, human_type
-from src.downloader.iranpaper import IranPaperClient
+from src.downloader.iranpaper import iranpaper_login, IranPaperClient
 from src.pdf_cleaner import clean_pdf_watermarks_async
 
 
@@ -210,7 +210,6 @@ def _openalex_abs_to_text(inv):
                 arr[i] = word
     return " ".join(w for w in arr if w)
 @dbg
-
 async def metadata(doi:str) -> Dict[str, Any]:
     async with aiohttp.ClientSession(headers={"User-Agent":"doi-bot/fast"}) as s:
         cr, oa = await asyncio.gather(xref(s, doi), oalex(s, doi))
@@ -441,59 +440,91 @@ class SciNetClient:
 
     @dbg
     async def _enable_ultrafast_request_listener(self):
-        """
-        شنود CDP با هماهنگ‌سازی responseReceived + loadingFinished.
-        فقط روی /request و /requests کار می‌کند؛ هیچ regex عمومی روی HTML اجرا نمی‌شود.
-        """
+
         import asyncio, json, base64, time as _t
         p = self.page; assert p
         self._cdp = await p.context.new_cdp_session(p)
-        await self._cdp.send("Network.enable", {})
+        try:
+            await self._cdp.send("Network.enable", {
+                "maxTotalBufferSize": 10 * 1024 * 1024,
+                "maxResourceBufferSize": 10 * 1024 * 1024
+            })
+        except Exception:
+            await self._cdp.send("Network.enable", {})
 
         dry = DRY_RUN
         self._pending: dict[str, dict] = {}
+        DOI_RE = self._doi_re
 
-        async def _process_body(request_id: str, url: str, body_text: str):
+        async def _handle_matches(src: str, url: str, text: str):
+            matches = DOI_RE.findall(text or "")
+            if matches:
+                self._log_detect(src=src, url=url or "", doi=",".join(matches), note="regex")
+                for m in matches:
+                    await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
+
+        async def on_request(params: dict):
             try:
-                if "/request" not in url and "/requests" not in url:
+                req  = (params or {}).get("request", {}) or {}
+                url  = req.get("url") or ""
+                post = req.get("postData") or ""
+                if not (url or post):
                     return
-
-                if "/requests" in url:
-                    try:
-                        data = json.loads(body_text) or {}
-                        docs = data.get("docs") or []
-                        if isinstance(docs, list):
-                            for doc in docs:
-                                await self._handle_new_request_payload(doc, dry=dry, is_doc=True)
-                    except Exception:
-                        pass
-                    return
-
-                if "/request" in url:
-                    try:
-                        data = json.loads(body_text) or {}
-                        node = (data.get("success") or {}).get("data") or data.get("data")
-                        if isinstance(node, dict):
-                            await self._handle_new_request_payload(node, dry=dry, is_doc=False)
-                    except Exception:
-                        pass
+                blob = f"{url}\n{post}"
+                matches = DOI_RE.findall(blob)
+                if matches:
+                    self._log_detect(src="cdp_req", url=url, doi=",".join(matches), note="from url/postData")
+                    for m in matches:
+                        await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
             except Exception:
-                if DEBUG_MODE:
-                    logger.exception("cdp _process_body failed")
+                if DEBUG_MODE: logger.exception("cdp on_request")
 
-        async def _stage_on_response(params: dict):
+        async def _process_body(url: str, body: str):
+            lurl = (url or "").lower()
+
+            # 1) لیستی: /requests
+            if "/requests" in lurl:
+                try:
+                    data = json.loads(body or "{}")
+                    docs = data.get("docs") or []
+                    if isinstance(docs, list):
+                        for doc in docs:
+                            if isinstance(doc, dict) and doc.get("doi"):
+                                self._log_detect(src="cdp_resp_list", url=url, doi=str(doc.get("doi")), note="docs[]")
+                            await self._handle_new_request_payload(doc, dry=dry, is_doc=True)
+                        return
+                except Exception:
+                    pass
+
+            # 2) تکی: /request
+            if "/request" in lurl:
+                try:
+                    data = json.loads(body or "{}")
+                    node = (data.get("success") or {}).get("data") or data.get("data")
+                    if isinstance(node, dict):
+                        if node.get("doi"):
+                            self._log_detect(src="cdp_resp_single", url=url, doi=str(node.get("doi")), note="success.data")
+                        await self._handle_new_request_payload(node, dry=dry, is_doc=False)
+                        return
+                except Exception:
+                    pass
+
+            # 3) عمومی‌تر: /api/* ، /graphql و هرچیزی → Regex
+            await _handle_matches("cdp_resp_generic", url, body or "")
+
+        async def on_response(params: dict):
             try:
                 resp = params.get("response") or {}
                 url  = resp.get("url") or ""
                 rid  = params.get("requestId")
-                if not rid or ("/request" not in url and "/requests" not in url):
+                if not rid:
                     return
+                # عمداً فیلتر URL نمی‌گذاریم تا پاسخ‌های /api/* هم استیج شوند.
                 self._pending[rid] = {"url": url, "ts": _t.time()}
             except Exception:
-                if DEBUG_MODE:
-                    logger.exception("ultrafast listener on_response staging failed")
+                if DEBUG_MODE: logger.exception("cdp on_response")
 
-        async def _on_loading_finished(params: dict):
+        async def on_loading_finished(params: dict):
             rid = params.get("requestId")
             entry = self._pending.pop(rid, None)
             if not entry:
@@ -507,36 +538,45 @@ class SciNetClient:
                         body = base64.b64decode(body).decode("utf-8", "ignore")
                     except Exception:
                         body = ""
-                if body:
-                    await _process_body(rid, url, body)
+                await _process_body(url, body)
             except Exception as e:
-                # خطاهای «resource not found / no data» رو ساکت رد کن
                 msg = str(e).lower()
                 if "no resource with given identifier" in msg or "no data found" in msg:
                     return
-                if DEBUG_MODE:
-                    logger.exception("ultrafast listener getResponseBody failed")
+                if DEBUG_MODE: logger.exception("cdp getResponseBody")
 
-        # اتصال رویدادهای CDP
-        self._cdp.on("Network.responseReceived", lambda p: asyncio.create_task(_stage_on_response(p)))
-        self._cdp.on("Network.loadingFinished", lambda p: asyncio.create_task(_on_loading_finished(p)))
+        async def on_ws_frame(params: dict):
+            try:
+                payload = ((params.get("response") or {}).get("payloadData")) or ""
+                if not payload:
+                    return
+                await _handle_matches("cdp_ws_rx", "", payload)
+            except Exception:
+                if DEBUG_MODE: logger.exception("cdp ws frame")
 
-        # فالو‌بک Playwright برای وقتی CDP چیزی نده
+        # ثبت رویدادها
+        self._cdp.on("Network.requestWillBeSent",  lambda ev: asyncio.create_task(on_request(ev)))
+        self._cdp.on("Network.responseReceived",   lambda ev: asyncio.create_task(on_response(ev)))
+        self._cdp.on("Network.loadingFinished",    lambda ev: asyncio.create_task(on_loading_finished(ev)))
+        try:
+            self._cdp.on("Network.webSocketFrameReceived", lambda ev: asyncio.create_task(on_ws_frame(ev)))
+        except Exception:
+            pass
+
+        # فالو‌بک Playwright
         async def _pw_on_response(resp):
             try:
                 url = resp.url or ""
-                if "/request" not in url and "/requests" not in url:
-                    return
+                txt = ""
                 ctype = (resp.headers or {}).get("content-type", "")
-                if "application/json" not in ctype.lower():
-                    return
-                txt = await resp.text()
-                await _process_body("pw", url, txt)
+                if "application/json" in ctype.lower():
+                    txt = await resp.text()
+                await _process_body(url, txt)
             except Exception:
-                if DEBUG_MODE:
-                    logger.exception("fallback page.on(response) failed")
+                if DEBUG_MODE: logger.exception("pw response fallback")
 
         p.on("response", lambda r: asyncio.create_task(_pw_on_response(r)))
+
 
     @dbg
     async def _inject_observer(self):
@@ -998,6 +1038,9 @@ async def done_cb(update:Update, context:ContextTypes.DEFAULT_TYPE):
         TG_CHAT, f"✅ درخواست <code>{doi}</code> بسته شد.", parse_mode="HTML"
     )
 
+
+
+
 # ── /start ─────────────────────────────────────────────────
 @dbg
 async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -1027,6 +1070,68 @@ async def heartbeat():
             logger.error("heartbeat telegram", exc_info=True)
         if not ok_browser:
             await bot_app.bot_data["client"]._recover("heartbeat failure")
+
+
+
+
+
+@dbg
+async def flush_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⛔️ فقط مالک اجازه دارد.")
+        return
+
+    mode = (context.args[0].lower() if context.args else "soft")
+    app = context.application
+    client: SciNetClient = app.bot_data["client"]
+    page: Page = client.page
+
+    doi = state.active
+
+    # 1) اگر DOI فعلی داریم، تلاش برای رد کردنش (refuse) از خودِ سشنِ صفحه
+    refused = False
+    if doi:
+        try:
+            refused = await page.evaluate("""
+                async(d) => {
+                    try {
+                      const r = await fetch('/refuse/' + encodeURIComponent(d), {
+                        method:'GET', credentials:'include', redirect:'manual'
+                      });
+                      const u = new URL(r.url, location.href);
+                      return r.redirected || r.ok || u.pathname.startsWith('/requests');
+                    } catch { return false; }
+                }
+            """, doi)
+        except Exception:
+            refused = False
+
+        # 2) چه رد شد چه نشد: busy رو آزاد کن و DOI رو به skipSet/State اضافه کن
+        try:
+            await page.evaluate("(d)=>{window.busy=false;(window.skipSet ||= new Set()).add(d);}", doi)
+        except Exception:
+            pass
+        if doi not in state.skip:
+            state.skip.append(doi)
+
+    # 3) ریست وضعیت فعال
+    state.active = None
+    state.save()
+
+    # 4) انتخاب حالت نرم/سخت
+    if mode in ("hard", "reset", "restart"):
+        await context.bot.send_message(TG_CHAT, f"♻️ Hard flush: ری‌استارت کانتکست مرورگر… (refused={refused})")
+        try:
+            await client._recover("user hard flush")
+        except Exception:
+            pass
+    else:
+        await context.bot.send_message(TG_CHAT, f"🧹 Soft flush: DOI فعلی رد/اسکیپ شد، صفحه ری‌لود می‌شود… (refused={refused})")
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+
 # ── main ───────────────────────────────────────────────────
 @dbg
 async def main():
@@ -1041,21 +1146,20 @@ async def main():
 
     iran_page = None
     giga_page = None
-    iran_client: Optional[IranPaperClient] = None
 
     if not DRY_RUN:
         if "iranpaper" in sources:
             iran_page = await client.page.context.new_page()
             print("[+] IranPaper tab opened successfully!")
             try:
-                # ← هماهنگ با تغییرات: استفاده از متد شیء
-                iran_client = IranPaperClient(IRANPAPER_USER, IRANPAPER_PASS, download_dir=str(DOWNLOAD_DIR))
-                await iran_client.login(iran_page)
-                asyncio.create_task(iran_client.periodic_relogin(iran_page, notify=send_telegram))
+                await iranpaper_login(iran_page)
+                ipc = IranPaperClient(IRANPAPER_USER, IRANPAPER_PASS, download_dir=str(DOWNLOAD_DIR))
+                asyncio.create_task(ipc.periodic_relogin(iran_page, notify=send_telegram))
             except Exception:
                 logger.exception("[IranPaper] login failed")
                 await iran_page.screenshot(path="iranpaper_login_error.png")
                 print("💥 IranPaper login failed; continuing without it.")
+
 
         if "gigalib" in sources:
             giga_page = await client.page.context.new_page()
@@ -1081,7 +1185,6 @@ async def main():
     bot_app.bot_data["client"] = client
     bot_app.bot_data["iran_page"] = iran_page
     bot_app.bot_data["giga_page"] = giga_page
-    bot_app.bot_data["iran_client"] = iran_client  # ← برای استفاده‌های بعدی
     bot_app.bot_data["state"] = state
 
     bot_app.add_handler(CommandHandler("start", start_cmd))
@@ -1090,23 +1193,31 @@ async def main():
     bot_app.add_handler(CommandHandler("testdoi", test_doi_cmd))
     bot_app.add_handler(CommandHandler("monitor", monitor_cmd))
     bot_app.add_handler(CommandHandler("diag", diag_cmd))
+    bot_app.add_handler(CommandHandler("flush", flush_cmd))
+
+
 
     logger.info("Bot started | DEBUG=%s | headful=%s | DRY_RUN=%s | sources=%s",
                 DEBUG_MODE, HEADFUL, DRY_RUN, sources)
 
     asyncio.create_task(heartbeat())
     print("[+] Telegram bot started ✅")
+    # به‌جای await bot_app.run_polling()
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling()
     logger.info("Polling started and running inside existing event loop")
 
     try:
+        # لوپ را زنده نگه می‌داریم (تا وقتی Ctrl+C بزنی)
         await asyncio.Future()
     finally:
+        # خاموش‌سازی تمیز
         await bot_app.updater.stop()
         await bot_app.stop()
         await bot_app.shutdown()
+
+
 
     
 # ── اد شده توسط ممد ────────────────────────────────────────────
