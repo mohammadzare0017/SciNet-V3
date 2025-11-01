@@ -4,9 +4,14 @@
 from __future__ import annotations
 import re
 import asyncio, os, random, logging
+
 from playwright.async_api import Page
+import asyncio
+import time
+import re
 from src.utils.stealth import human_sleep, human_move_mouse
 from pathlib import Path
+
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
 
 
@@ -430,4 +435,5 @@ async def iranpaper_download(page: Page, doi: str, download_dir: str = str(DOWNL
     # 6-d) آخرین تلاش: کمی صبر و اگر باز هم نشد، اسکرین‌شات برای دیباگ
     await popup.screenshot(path=f"iranpaper_viewer_error_{doi.replace('/', '_')}.png", full_page=True)
     raise RuntimeError("Could not obtain PDF from viewer or context download.")
+
 
