@@ -1,0 +1,430 @@
+#iranpaper.py
+
+
+from __future__ import annotations
+import re
+import asyncio, os, random, logging
+from playwright.async_api import Page
+from src.utils.stealth import human_sleep, human_move_mouse
+from pathlib import Path
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
+
+
+from typing import Optional, Awaitable, Callable
+logger = logging.getLogger(__name__)
+
+NotifyFn = Callable[..., Awaitable[None]]
+
+class IranPaperClient:
+    def __init__(self, username: str, password: str, download_dir: str = str(DOWNLOAD_DIR)):
+        self.username = username
+        self.password = password
+        self.download_dir = download_dir  # string ok
+        os.makedirs(download_dir, exist_ok=True)
+
+    async def download_by_doi(self, doi: str) -> str:
+     
+        await asyncio.sleep(1)
+        fake_path = os.path.join(self.download_dir, f"{doi.replace('/', '_')}.pdf")
+
+        with open(fake_path, "wb") as f:
+            f.write(b"%PDF-1.4\n%Fake PDF content\n%%EOF")
+
+        print(f"[IranPaper] Simulated download complete: {fake_path}")
+        return fake_path
+    
+    async def periodic_relogin(self, page: Page, notify: Optional[NotifyFn] = None):
+        while True:
+            wait_time = random.randint(4 * 3600, 6 * 3600)  # بین ۴ تا ۶ ساعت
+            logger.info(f"🕒 ورود مجدد بعد از {wait_time // 3600} ساعت.")
+            await asyncio.sleep(wait_time)
+
+            try:
+                logger.info("🔄 شروع فرآیند خروج و ورود مجدد به IranPaper...")
+                await page.goto("https://iranpaper.ir/logout", timeout=30000)
+                await asyncio.sleep(3)
+
+                await page.goto("https://iranpaper.ir/login", timeout=30000)
+                await page.fill('input[name="email"]', os.getenv("IRANPAPER_USER"))
+                await page.fill('input[name="password"]', os.getenv("IRANPAPER_PASS"))
+                await page.click('button[type="submit"]')
+                await page.wait_for_load_state("networkidle")
+
+                logger.info("✅ ورود مجدد به IranPaper با موفقیت انجام شد.")
+
+                # اگر کالبک نوتیفایر داده شده، خبر بده
+                if notify is not None:
+                    await notify(
+                        doi="N/A",
+                        title="🔄 IranPaper relogin",
+                        year="",
+                        journal="System",
+                        abstract="ورود مجدد خودکار به IranPaper انجام شد."
+                    )
+            except Exception as e:
+                logger.error(f"❌ خطا در ورود مجدد به IranPaper: {e}", exc_info=True)
+
+async def _iranpaper_is_logged_in(page: Page) -> bool:
+    """
+    اگر لاگین باشیم، یکی از این نشانه‌ها در هدر دیده می‌شود:
+      - لینک/دکمه «خروج»
+      - نام/منوی کاربر (مثلاً «رویا» مثل اسکرین‌شات)
+    """
+    markers = [
+        'a[href*="logout"]',
+        'a:has-text("خروج")',
+        'button:has-text("خروج")',
+        'header :has-text("رویا")',        
+        'nav :has-text("رویا")',
+    ]
+    for sel in markers:
+        try:
+            if await page.locator(sel).count() > 0:
+                return True
+        except Exception:
+            pass
+    return False
+
+async def iranpaper_login(page: Page):
+    user = os.getenv("IRANPAPER_USER")
+    password = os.getenv("IRANPAPER_PASS")
+
+    print("[+] Logging into IranPaper...")
+
+    try:
+        # همیشه اول صفحهٔ اصلی
+        await page.goto("https://iranpaper.ir/", timeout=60000, wait_until="domcontentloaded")
+
+        # اگر همین حالا لاگینیم، تمام
+        if await _iranpaper_is_logged_in(page):
+            print("[+] IranPaper already logged in; skipping login form.")
+            try:
+                await page.context.storage_state(path="session_iranpaper.json")
+            except Exception:
+                pass
+            return
+
+        # هر بنر/کوکی مزاحم را ببند
+        for sel in [
+            'button:has-text("قبول")',
+            'button:has-text("باشه")',
+            'button:has-text("موافقم")',
+            '#cookie-accept', '.cookie-accept', 'button[aria-label="close"]'
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click(timeout=1500)
+            except Exception:
+                pass
+
+        # دکمهٔ «ورود» را پیدا و کلیک کن
+        for sel in [
+            'a:has-text("ورود")',
+            'button:has-text("ورود")',
+            'a[href*="login"]',
+            'a[href*="signin"]',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click(timeout=3000)
+                    await asyncio.sleep(0.5)
+                    break
+            except Exception:
+                pass
+
+        # فرم را (در بدنه یا فریم) پر کن
+        async def fill_form(root):
+            email = root.locator(
+                'input[name="email"], input[type="email"], input[placeholder*="ایمیل"], input[placeholder*="نام\u200cکاربری"]'
+            ).first
+            await email.wait_for(state="visible", timeout=10000)
+            await email.click()
+            await email.fill(user)
+
+            pwd = root.locator(
+                'input[name="password"], input[type="password"], input[placeholder*="رمز"]'
+            ).first
+            await pwd.wait_for(state="visible", timeout=10000)
+            await pwd.click()
+            await pwd.fill(password)
+
+            # ارسال
+            try:
+                btn = root.get_by_role("button", name=re.compile(r"(ورود|login|sign ?in)", re.I))
+                await btn.click(timeout=4000)
+            except Exception:
+                await root.locator('button[type="submit"], input[type="submit"]').first.click(timeout=4000)
+
+        try:
+            await fill_form(page)
+        except Exception:
+            filled = False
+            for f in page.frames:
+                try:
+                    await fill_form(f); filled = True; break
+                except Exception:
+                    continue
+            if not filled:
+                raise
+
+        # منتظر پایدار شدن و تأیید لاگین
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        if not await _iranpaper_is_logged_in(page):
+            await page.screenshot(path="login_error.png", full_page=True)
+            raise RuntimeError("Login not confirmed (no logout/user markers).")
+
+        await page.context.storage_state(path="session_iranpaper.json")
+        print("[+] Logged into IranPaper successfully!")
+
+    except Exception as e:
+        print(f"💥 خطای جدی در لاگین ایران‌پیپر: {e}")
+        try:
+            await page.screenshot(path="login_error.png", full_page=True)
+            print("📸 اسکرین‌شات از خطا در فایل login_error.png ذخیره شد.")
+        except Exception:
+            pass
+        raise
+
+
+
+async def iranpaper_download(page: Page, doi: str, download_dir: str = str(DOWNLOAD_DIR)) -> str:
+    """
+    سرچ DOI در ایران‌پیپر با سلکتورهای مقاوم:
+      - اگر باکس جستجو نیامد، روی «لینک مقاله با DOI» کلیک می‌کنیم
+      - هم input و هم textarea پوشش داده می‌شوند
+      - اگر دکمه‌ی جستجو پیدا نشد، Enter می‌زنیم
+      - سپس روی «دانلود فایل» دانلود مستقیم یا پاپ‌آپ را هندل می‌کنیم
+    """
+    import os, re
+    from pathlib import Path
+    from urllib.parse import urljoin
+
+    doi = doi.strip()
+    print(f"[+] Searching DOI on IranPaper: {doi}")
+
+    await page.goto("https://iranpaper.ir", timeout=60000, wait_until="load")
+
+    # 1) اگر باکس جستجو آماده نبود، روی «لینک مقاله با DOI» کلیک کن
+    try:
+        # گاهی این آیکون باید فعال شود تا باکس زیری برای DOI در فوکوس قرار گیرد
+        tile = page.locator('button:has-text("لینک\u200cمقاله با DOI"), button:has-text("لینک مقاله با DOI")')
+        if await tile.count() > 0 and await tile.first.is_visible():
+            await tile.first.click(timeout=2000)
+    except Exception:
+        pass
+
+    # 2) تکست‌باکس را با سلکتورهای جایگزین پیدا کن (role/name/placeholder و هر دو input/textarea)
+    search_locators = [
+        # role-based (مطمئن‌تر)
+        lambda p: p.get_by_role("textbox", name=re.compile(r"لینک.*شناسه\s*DOI", re.S)),
+        # aria-label فارسی (input یا textarea)
+        lambda p: p.locator('input[aria-label*="شناسه DOI"], textarea[aria-label*="شناسه DOI"]'),
+        # placeholder فارسی
+        lambda p: p.locator('input[placeholder*="شناسه DOI"], textarea[placeholder*="شناسه DOI"]'),
+        # fallback عمومی‌تر
+        lambda p: p.locator('input[type="text"], textarea').first,
+    ]
+
+    box = None
+    for maker in search_locators:
+        try:
+            cand = maker(page)
+            await cand.wait_for(state="visible", timeout=4000)
+            box = cand
+            break
+        except Exception:
+            continue
+    if box is None:
+        # برای دیباگ: اسکرین‌شات بگیر و خطا بده
+        await page.screenshot(path="iranpaper_no_searchbox.png", full_page=True)
+        raise RuntimeError("Search box for DOI not found on IranPaper (selectors outdated).")
+
+    # 3) DOI را وارد کن و جستجو را بزن
+    await box.click()
+    await box.fill(doi)
+
+    # دکمه جستجو (چند احتمال)
+    search_btns = [
+        lambda p: p.locator(".d-inline.pa-3").first,
+        lambda p: p.get_by_role("button", name=re.compile(r"(جستجو|search)", re.I)),
+        lambda p: p.locator('button[type="submit"]').first,
+    ]
+    clicked = False
+    for maker in search_btns:
+        try:
+            btn = maker(page)
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.click(timeout=1500)
+                clicked = True
+                break
+        except Exception:
+            continue
+    if not clicked:
+        # اگر دکمه پیدا نشد، Enter بزن
+        try:
+            await box.press("Enter")
+            clicked = True
+        except Exception:
+            pass
+
+    # 4) انتظار برای دکمه «دانلود فایل»
+    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_selector('button:has-text("دانلود فایل"), a:has-text("دانلود فایل")', timeout=60000)
+    btn = page.locator('button:has-text("دانلود فایل"), a:has-text("دانلود فایل")').first
+
+    # 5) کلیک و RACE بین دانلود و پاپ‌آپ — فقط یک کلیک (DOM)، نه دو تا!
+    ctx = page.context
+    pre_pages = set(ctx.pages)
+
+    # دو سناریو را همزمان رصد می‌کنیم
+    dl_task  = asyncio.create_task(ctx.wait_for_event("download", timeout=40000))
+    pop_task = asyncio.create_task(ctx.wait_for_event("page",     timeout=40000))
+
+    # ❗️مهم: فقط همین یک‌بار کلیک می‌کنیم تا دابل‌تب اتفاق نیافتد
+    await btn.evaluate("""
+(el) => {
+  // کمی محافظت برای جلوگیری از دوباره‌کلیک ناخواسته
+  el.style.pointerEvents = 'none';
+  setTimeout(() => { el.style.pointerEvents = ''; }, 1500);
+  el.click();
+}
+""")
+
+    done, pending = await asyncio.wait({dl_task, pop_task}, return_when=asyncio.FIRST_COMPLETED, timeout=45)
+
+    # --- حالت A: دانلود مستقیم در هر تب/کانتکست ---
+    if dl_task in done:
+        download = await dl_task
+        safe = doi.replace("/", "_").replace(":", "_")
+        out = Path(download_dir) / f"{safe}.pdf"
+        await download.save_as(out)
+
+        # تب‌های جدیدی که با کلیک باز شده‌اند را ببند تا شلوغ نشود
+        new_pages = [p for p in ctx.pages if p not in pre_pages]
+        for p in new_pages:
+            try: await p.close()
+            except: pass
+
+        for t in pending: t.cancel()
+        print(f"[+] Article downloaded (context-level): {out}")
+        return str(out)
+
+    # --- حالت B: پاپ‌آپ/ویوِر باز شده است ---
+    popup = await pop_task
+    for t in pending: t.cancel()
+
+    # اگر بیش از یک تب باز شده، فقط تبِ «viewer/PDF» را نگه داریم
+    await asyncio.sleep(0.6)  # کمی فرصت برای گرفتن url/title
+    new_pages = [p for p in ctx.pages if p not in pre_pages]
+    if len(new_pages) > 1:
+        keep = None
+        for p in new_pages:
+            try:
+                u = (p.url or "").lower()
+                t = (await p.title() or "").lower()
+                if u.endswith(".pdf") or "viewer" in u or "pdf" in u or "pdf" in t:
+                    keep = p; break
+            except Exception:
+                pass
+        if keep is None:
+            keep = popup
+        for p in new_pages:
+            if p is not keep:
+                try: await p.close()
+                except: pass
+        popup = keep
+
+    await popup.wait_for_load_state("domcontentloaded")
+
+    # 6) تلاش برای دکمه‌ی Download داخل ویوِر (pdf.js و مشابه)
+    async def try_viewer_button() -> str | None:
+        selectors = [
+            'button.gsr-flat-btn[aria-label="Download"]',
+            'button[aria-label="Download"]',
+            '#download',
+            'a[download]'
+        ]
+        for sel in selectors:
+            try:
+                loc = popup.locator(sel).first
+                if await loc.count() == 0 or not await loc.is_visible():
+                    continue
+
+                # ریس دوباره: یا دانلود می‌آید یا href داریم
+                dl_f = asyncio.create_task(ctx.wait_for_event("download", timeout=20000))
+                try:
+                    await loc.click()
+                except Exception:
+                    pass
+
+                try:
+                    dld = await dl_f
+                    safe = doi.replace("/", "_").replace(":", "_")
+                    out = Path(download_dir) / f"{safe}.pdf"
+                    await dld.save_as(out)
+                    await popup.close()
+                    return str(out)
+                except Exception:
+                    # اگر دانلود نیامد، شاید href داشته باشد
+                    try:
+                        href = await loc.get_attribute("href")
+                        if href:
+                            return await download_via_http(href)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        return None
+
+    # Helperها
+    import re
+    from urllib.parse import urljoin
+    def _dispo_name(headers: dict) -> str | None:
+        cd = (headers or {}).get("content-disposition") or (headers or {}).get("Content-Disposition") or ""
+        m = re.search(r'filename\*?=(?:UTF-8\'\'|\"?)([^\";]+)\"?', cd)
+        return m.group(1) if m else None
+
+    async def download_via_http(pdf_url: str) -> str:
+        pdf_url = urljoin(popup.url, pdf_url)
+        resp = await popup.context.request.get(pdf_url, headers={"Referer": popup.url})
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} for {pdf_url}")
+        name = _dispo_name(resp.headers) or (pdf_url.split("/")[-1] or "file.pdf")
+        if not name.lower().endswith(".pdf"):
+            name += ".pdf"
+        name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+        out = Path(download_dir) / name
+        out.write_bytes(await resp.body())
+        await popup.close()
+        return str(out)
+
+    # 6-a) دکمه‌ی داخل ویوِر
+    got = await try_viewer_button()
+    if got:
+        return got
+
+    # 6-b) iframe/embed → src را بگیر و HTTP دانلود کن
+    try:
+        await popup.wait_for_selector("embed[src], iframe[src]", timeout=15000)
+        src = await popup.locator("embed[src], iframe[src]").first.get_attribute("src")
+        if src:
+            return await download_via_http(src)
+    except Exception:
+        pass
+
+    # 6-c) اگر popup خودش مستقیم PDF بود یا در URL مشخص است
+    try:
+        if popup.url.lower().endswith(".pdf"):
+            return await download_via_http(popup.url)
+    except Exception:
+        pass
+
+    # 6-d) آخرین تلاش: کمی صبر و اگر باز هم نشد، اسکرین‌شات برای دیباگ
+    await popup.screenshot(path=f"iranpaper_viewer_error_{doi.replace('/', '_')}.png", full_page=True)
+    raise RuntimeError("Could not obtain PDF from viewer or context download.")

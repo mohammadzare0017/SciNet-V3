@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  scinet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: scinet-bot:latest
+    container_name: scinet_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1024M
+    # شبکه براساس نیاز اضافه کن (bridge پیش‌فرض اوکیه)
+

@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  scinet:
+    build: .
+    container_name: scinet_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data           # ذخیره state/فایل‌های دانلود شده (اختیاری)
+    # اگر خواستی لاگ ها را به فایل میزبان برگردونی:
+    # logging:
+    #   driver: "json-file"
+    #   options:
+    #     max-size: "10m"
+    #     max-file: "5"
+
