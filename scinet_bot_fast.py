@@ -18,7 +18,7 @@ import base64, re
 
 from src.downloader.gigalib import gigalib_login, gigalib_download
 from src.utils.stealth import human_sleep, human_type
-from src.downloader.iranpaper import iranpaper_login, IranPaperClient
+from src.downloader.iranpaper import IranPaperClient
 from src.pdf_cleaner import clean_pdf_watermarks_async
 
 
@@ -1041,20 +1041,21 @@ async def main():
 
     iran_page = None
     giga_page = None
+    iran_client: Optional[IranPaperClient] = None
 
     if not DRY_RUN:
         if "iranpaper" in sources:
             iran_page = await client.page.context.new_page()
             print("[+] IranPaper tab opened successfully!")
             try:
-                await iranpaper_login(iran_page)
-                ipc = IranPaperClient(IRANPAPER_USER, IRANPAPER_PASS, download_dir=str(DOWNLOAD_DIR))
-                asyncio.create_task(ipc.periodic_relogin(iran_page, notify=send_telegram))
+                # ← هماهنگ با تغییرات: استفاده از متد شیء
+                iran_client = IranPaperClient(IRANPAPER_USER, IRANPAPER_PASS, download_dir=str(DOWNLOAD_DIR))
+                await iran_client.login(iran_page)
+                asyncio.create_task(iran_client.periodic_relogin(iran_page, notify=send_telegram))
             except Exception:
                 logger.exception("[IranPaper] login failed")
                 await iran_page.screenshot(path="iranpaper_login_error.png")
                 print("💥 IranPaper login failed; continuing without it.")
-
 
         if "gigalib" in sources:
             giga_page = await client.page.context.new_page()
@@ -1080,6 +1081,7 @@ async def main():
     bot_app.bot_data["client"] = client
     bot_app.bot_data["iran_page"] = iran_page
     bot_app.bot_data["giga_page"] = giga_page
+    bot_app.bot_data["iran_client"] = iran_client  # ← برای استفاده‌های بعدی
     bot_app.bot_data["state"] = state
 
     bot_app.add_handler(CommandHandler("start", start_cmd))
@@ -1089,28 +1091,22 @@ async def main():
     bot_app.add_handler(CommandHandler("monitor", monitor_cmd))
     bot_app.add_handler(CommandHandler("diag", diag_cmd))
 
-
     logger.info("Bot started | DEBUG=%s | headful=%s | DRY_RUN=%s | sources=%s",
                 DEBUG_MODE, HEADFUL, DRY_RUN, sources)
 
     asyncio.create_task(heartbeat())
     print("[+] Telegram bot started ✅")
-    # به‌جای await bot_app.run_polling()
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.updater.start_polling()
     logger.info("Polling started and running inside existing event loop")
 
     try:
-        # لوپ را زنده نگه می‌داریم (تا وقتی Ctrl+C بزنی)
         await asyncio.Future()
     finally:
-        # خاموش‌سازی تمیز
         await bot_app.updater.stop()
         await bot_app.stop()
         await bot_app.shutdown()
-
-
 
     
 # ── اد شده توسط ممد ────────────────────────────────────────────
