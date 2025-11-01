@@ -224,7 +224,6 @@ async def metadata(doi:str) -> Dict[str, Any]:
     }
 
 
-# ── Playwright client ───────────────────────────────────────
 class SciNetClient:
     def __init__(self):
         self.page: Page | None = None
@@ -235,6 +234,28 @@ class SciNetClient:
         self._seen_dois: set[str] = set()
         self._doi_re = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.I)
         self._keepalive_task: asyncio.Task | None = None
+        # لاگ تشخیص‌ها را حتی در حالت غیر DEBUG هم می‌توان روشن گذاشت
+        self._detect_log_enabled = os.getenv("DETECT_LOG", "1") == "1"
+
+    def _log_detect(self, *, src: str, url: str | None = None,
+                    doi: str | None = None, note: str | None = None,
+                    preview: str | None = None):
+        """لاگ ساختاریافته برای تشخیص DOI از منابع مختلف (CDP/Ws/Observer/Request/Response)."""
+        if not self._detect_log_enabled:
+            return
+        try:
+            msg = {
+                "event": "DETECT",
+                "src": src,
+                "doi": doi or "",
+                "url": url or "",
+                "note": note or "",
+                "preview": (preview[:300] + "…") if (preview and len(preview) > 300) else (preview or "")
+            }
+            logger.info(json.dumps(msg, ensure_ascii=False))
+        except Exception:
+            logger.info("[DETECT] src=%s doi=%s url=%s note=%s",
+                        src, doi or "-", url or "-", note or "-")
 
     # --- startup ---------------------------------------------------------
     @dbg
@@ -255,13 +276,21 @@ class SciNetClient:
         session_file = Path("session_giga_iran.json")
         ctx_kwargs = dict(user_agent=ua, bypass_csp=True)
         if session_file.exists():
-            ctx_kwargs["storage_state"] = str(session_file)  
+            ctx_kwargs["storage_state"] = str(session_file)
 
         ctx = await self._browser.new_context(**ctx_kwargs)
 
         if DEBUG_MODE:
+            def _req_failed(r):
+                try:
+                    if r.method == "HEAD":  # نویز keepalive را نادیده بگیر
+                        return
+                except Exception:
+                    pass
+                logger.debug(" FAIL %s %s", r.method, r.url)
+
             ctx.on("console", lambda m: logger.debug(" JS: %s", m.text))
-            ctx.on("requestfailed", lambda r: logger.debug(" FAIL %s %s", r.method, r.url))
+            ctx.on("requestfailed", _req_failed)
 
         self.page = await ctx.new_page()
         self.page.on("crash", lambda *_: asyncio.create_task(self._recover("page crash")))
@@ -276,7 +305,7 @@ class SciNetClient:
 
             # فالو‌بک: هوک سمت کلاینت (رویداد داخلی و wrap کردن arequest)
             await self._inject_observer()
-            
+
             self._start_keepalive()
 
             # فقط وقتی DRY روشنه، لاگر DRY را فعال کن
@@ -361,7 +390,7 @@ class SciNetClient:
 
     # --- recovery --------------------------------------------------------
     @dbg
-    async def _recover(self, reason:str):
+    async def _recover(self, reason: str):
         logger.warning("🚑 Browser recovery: %s", reason)
         self._cancel_keepalive()
         try:
@@ -399,23 +428,50 @@ class SciNetClient:
     @dbg
     async def _enable_ultrafast_request_listener(self):
         """
-        شنود CDP برای پاسخ‌های شبکه و واکنش فوری به /request یا /requests.
+        شنود CDP برای پاسخ‌های شبکه و واکنش فوری به /request یا /requests
+        + شکار از URL/postData + WebSocket (سرعت حداکثری).
         """
         p = self.page; assert p
         self._cdp = await p.context.new_cdp_session(p)
-        await self._cdp.send("Network.enable", {})
+        # بزرگ‌کردن بافرها (در برخی نسخه‌ها بی‌اثر است ولی ضرری ندارد)
+        try:
+            await self._cdp.send("Network.enable", {
+                "maxTotalBufferSize": 10 * 1024 * 1024,
+                "maxResourceBufferSize": 10 * 1024 * 1024
+            })
+        except Exception:
+            await self._cdp.send("Network.enable", {})
 
         dry = DRY_RUN
 
+        # ➊ شکار «پیش از پاسخ» — سریع‌تر از responseReceived
+        async def on_request(params: dict):
+            try:
+                req  = (params or {}).get("request", {}) or {}
+                url  = (req.get("url") or "")
+                if not url:
+                    return
+                lurl = url.lower()
+                interesting = any(k in lurl for k in ("/request", "/requests", "/api/", "/graphql"))
+                post = req.get("postData") or ""
+                blob = f"{url}\n{post}"
+                for m in self._doi_re.findall(blob):
+                    self._log_detect(src="cdp_req", url=url, doi=m, note=("interesting" if interesting else "from_post/url"))
+                    await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
+            except Exception:
+                if DEBUG_MODE:
+                    logger.exception("ultrafast request listener failed")
+
+        # ➋ شکار «پس از پاسخ»
         async def on_response(params: dict):
             try:
                 resp = params.get("response", {}) or {}
-                url  = resp.get("url", "") or ""
+                url  = (resp.get("url", "") or "")
                 if not url:
                     return
-                # فقط endpoint های مرتبط
-                if "/request" not in url and "/requests" not in url:
-                    return
+                lurl = url.lower()
+                # فیلتر بازتر: /request, /requests, /api/*, /graphql
+                interesting = any(k in lurl for k in ("/request", "/requests", "/api/", "/graphql"))
 
                 req_id = params.get("requestId")
                 if not req_id:
@@ -429,40 +485,82 @@ class SciNetClient:
                         return
 
                 # 1) حالت لیست: /requests با docs
-                if "/requests" in url:
+                if "/requests" in lurl:
                     try:
                         data = json.loads(body)
                         docs = (data or {}).get("docs") or []
                         if isinstance(docs, list):
                             for doc in docs:
+                                if isinstance(doc, dict) and "doi" in doc:
+                                    self._log_detect(src="cdp_resp_list", url=url, doi=str(doc.get("doi")), note="docs[]")
                                 await self._handle_new_request_payload(doc, dry=dry, is_doc=True)
                     except Exception:
-                        # اگر JSON نبود، نهایتاً DOI را شکار کن
-                        for m in self._doi_re.findall(body):
+                        matches = self._doi_re.findall(body)
+                        if matches:
+                            self._log_detect(src="cdp_resp_list", url=url, doi=",".join(matches),
+                                             note="regex_fallback", preview=body[:300])
+                        for m in matches:
                             await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
                     return
 
                 # 2) حالت تکی: /request با success.data
-                if "/request" in url:
+                if "/request" in lurl:
                     node = None
                     try:
                         data = json.loads(body)
                         node = (data.get("success") or {}).get("data") or data.get("data")
                     except Exception:
-                        for m in self._doi_re.findall(body):
+                        matches = self._doi_re.findall(body)
+                        if matches:
+                            self._log_detect(src="cdp_resp_single", url=url, doi=",".join(matches),
+                                             note="regex_fallback", preview=body[:300])
+                        for m in matches:
                             await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=False)
                         return
 
                     if not isinstance(node, dict):
                         return
 
+                    if "doi" in node:
+                        self._log_detect(src="cdp_resp_single", url=url, doi=str(node.get("doi")), note="success.data")
                     await self._handle_new_request_payload(node, dry=dry, is_doc=False)
+                    return
+
+                # 3) حالت عمومی‌تر (/api/* یا /graphql یا هر پاسخ دیگری) با Regex DOI
+                matches = self._doi_re.findall(body)
+                if matches:
+                    self._log_detect(src="cdp_resp_generic", url=url, doi=",".join(matches),
+                                     note="regex_generic", preview=body[:300])
+                for m in matches:
+                    await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
 
             except Exception:
                 if DEBUG_MODE:
                     logger.exception("ultrafast listener failed")
 
-        self._cdp.on("Network.responseReceived", lambda p: asyncio.create_task(on_response(p)))
+        # رویدادهای CDP را ثبت کنیم
+        self._cdp.on("Network.requestWillBeSent",  lambda ev: asyncio.create_task(on_request(ev)))
+        self._cdp.on("Network.responseReceived",   lambda ev: asyncio.create_task(on_response(ev)))
+
+        # ➌ شنود WebSocket برای payloadهایی که DOI درونشان است (push-based sites)
+        async def on_ws_frame(params: dict):
+            try:
+                payload = ((params.get("response") or {}).get("payloadData")) or ""
+                if not payload:
+                    return
+                matches = self._doi_re.findall(payload)
+                if matches:
+                    self._log_detect(src="cdp_ws_rx", url="", doi=",".join(matches),
+                                     note="ws_frame", preview=payload[:300])
+                for m in matches:
+                    await self._handle_new_request_payload({"doi": m}, dry=dry, is_doc=True)
+            except Exception:
+                if DEBUG_MODE:
+                    logger.exception("ws sniff failed")
+        try:
+            self._cdp.on("Network.webSocketFrameReceived", lambda ev: asyncio.create_task(on_ws_frame(ev)))
+        except Exception:
+            pass
 
     @dbg
     async def _inject_observer(self):
@@ -516,7 +614,9 @@ class SciNetClient:
 
             // DRY: فقط اعلان
             if (DRY) {{
-              try {{ await window.__notify_py(payload); }} catch (e) {{}}
+              try {{
+                await window.__notify_py(Object.assign({{}}, payload, {{__src:"js_observer"}}));
+              }} catch (e) {{}}
               return;
             }}
 
@@ -539,7 +639,9 @@ class SciNetClient:
                          final.pathname.startsWith('/work/') || final.pathname.startsWith('/requests/');
               if (ok) {{
                 window.skipSet.add(doi);
-                try {{ await window.__notify_py(payload); }} catch (e) {{}}
+                try {{
+                  await window.__notify_py(Object.assign({{}}, payload, {{__src:"js_observer"}}));
+                }} catch (e) {{}}
               }} else {{
                 window.busy = false;
                 try {{ await window.__notify_py({{ doi, reason: "competitor_won" }}); }} catch (e) {{}}
@@ -547,7 +649,6 @@ class SciNetClient:
               }}
             }} catch (e) {{
               window.busy = false;
-              
             }}
           }}
 
@@ -559,6 +660,7 @@ class SciNetClient:
             if (!window.__scinet_req_listener_installed) {{
               _push(handleDoc);
               window.__scinet_req_listener_installed = true;
+              try {{ console.debug("observer: events.request hook installed"); }} catch(e){{}}
             }}
             window.events.request.push = function(fn) {{ return _push(fn); }};
           }} catch (e) {{}}
@@ -571,6 +673,7 @@ class SciNetClient:
                 return _arequest(endpoint, function(resp) {{
                   try {{
                     if (endpoint === 'requests' && resp && Array.isArray(resp.docs)) {{
+                      try {{ console.debug("observer: arequest('requests') intercepted, docs=", resp.docs.length); }} catch(e){{}}
                       for (const d of resp.docs) handleDoc(d);
                     }}
                   }} catch (e) {{}}
@@ -578,15 +681,17 @@ class SciNetClient:
                 }}, params);
               }};
               window.__scinet_arequest_wrapped = true;
+              try {{ console.debug("observer: arequest wrapper installed"); }} catch(e){{}}
             }}
           }} catch (e) {{}}
 
           window.__observerAlive = true;
+          try {{ console.debug("observer: injected and alive"); }} catch(e){{}}
         }})();
         """)
         await p.add_init_script(js)
         await p.goto(SCINET_URL)
-    
+
     def _cancel_keepalive(self):
         """تسکِ پینگ را اگر در حال اجراست، متوقف می‌کند."""
         try:
@@ -647,7 +752,6 @@ class SciNetClient:
             # فاصله‌ی تصادفی بین 20 تا 40 ثانیه
             await asyncio.sleep(random.uniform(20, 40))
 
-
     @dbg
     async def _handle_new_request_payload(self, node_or_payload: dict, dry: bool = False, is_doc: bool = True):
         """
@@ -656,6 +760,7 @@ class SciNetClient:
         - اگر عادی: پیش‌سنجی عنوان → تلاش فوری برای /take → notify
         """
         # استخراج فیلدها از داکیومنت یا payload
+        src_hint = node_or_payload.get("__src") if isinstance(node_or_payload, dict) else None
         if is_doc:
             doi = (node_or_payload.get("doi") or node_or_payload.get("DOI") or node_or_payload.get("id") or "").strip()
             req = node_or_payload.get("request") or {}
@@ -682,6 +787,11 @@ class SciNetClient:
 
         if not doi:
             return
+
+        # لاگ کشف (اولین نقطه)
+        self._log_detect(src=src_hint or "handler",
+                         url=payload.get("detail"), doi=doi,
+                         note="handle_new_request_payload")
 
         # --- PRE-TAKE: فقط روی عنوان، بدون Crossref ---
         title = ""
@@ -744,7 +854,7 @@ class SciNetClient:
 
     # --- JS→Python bridge -----------------------------------------------
     @dbg
-    async def _notify_py(self, payload:Dict[str,str]):
+    async def _notify_py(self, payload: Dict[str, str]):
         doi = payload.get("doi", "")
         reason = payload.get("reason")
 
@@ -841,6 +951,7 @@ class SciNetClient:
             detail=urljoin(SCINET_URL, payload.get("detail", ""))
         )
         asyncio.create_task(start_download_process(bot_app, payload, meta))
+
 
 # ── Telegram helpers ───────────────────────────────────────
 @dbg
@@ -995,6 +1106,8 @@ async def main():
     bot_app.add_handler(CallbackQueryHandler(toggle_cb, pattern="^(on|off)$"))
     bot_app.add_handler(CommandHandler("testdoi", test_doi_cmd))
     bot_app.add_handler(CommandHandler("monitor", monitor_cmd))
+    bot_app.add_handler(CommandHandler("diag", diag_cmd))
+
 
     logger.info("Bot started | DEBUG=%s | headful=%s | DRY_RUN=%s | sources=%s",
                 DEBUG_MODE, HEADFUL, DRY_RUN, sources)
@@ -1444,6 +1557,65 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # اجرای وظیفه در پس‌زمینه
     asyncio.create_task(monitor_loop(page, duration_seconds))
+
+# ── /diag ──────────────────────────────────
+@dbg
+async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return
+
+    app = context.application
+    state_obj = app.bot_data.get("state")
+    client: SciNetClient = app.bot_data.get("client")
+    page = getattr(client, "page", None)
+
+    # اطلاعات سمت JS در تب Sci-Net
+    js_info = {}
+    if page:
+        try:
+            js_info = await page.evaluate("""
+                () => ({
+                    url: location.href,
+                    enabled: Boolean(window.enabled),
+                    busy: Boolean(window.busy),
+                    observerAlive: Boolean(window.__observerAlive),
+                    hasArequest: !!window.arequest,
+                    eventsReqLen: (window.events && window.events.request && window.events.request.length) || 0,
+                    skipSetSize: (window.skipSet && window.skipSet.size) || 0,
+                    ts: new Date().toISOString()
+                })
+            """)
+        except Exception as e:
+            js_info = {"js_error": str(e)}
+    else:
+        js_info = {"page": "missing"}
+
+    # اطلاعات سمت سرور/بات
+    srv_info = {
+        "DRY_RUN": DRY_RUN,
+        "DEBUG_MODE": DEBUG_MODE,
+        "HEADFUL": HEADFUL,
+        "state_enabled": getattr(state_obj, "enabled", None),
+        "state_active": getattr(state_obj, "active", None),
+        "state_skip_len": len(getattr(state_obj, "skip", []) or []),
+        "seen_dois_len": len(getattr(client, "_seen_dois", set()) or []),
+        "seen_ids_len": len(getattr(client, "_seen_ids", set()) or []),
+    }
+
+    payload = {"server": srv_info, "client_js": js_info}
+    text = "diag:\n<code>" + html.escape(json.dumps(payload, ensure_ascii=False, indent=2)) + "</code>"
+
+    try:
+        # ترجیحاً جواب را در همانی که دستور را زدی بفرست
+        if update.effective_chat:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode="HTML")
+        else:
+            await update.message.reply_text(text, parse_mode="HTML")
+    except Exception:
+        #fallback کوتاه
+        await update.message.reply_text("diag: " + str(payload))
+
+
 
 @dbg
 async def monitor_loop(page: Page, duration_seconds: int):
